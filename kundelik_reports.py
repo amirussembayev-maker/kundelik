@@ -77,8 +77,7 @@ def gs_retry(func, *args, retries=6, **kwargs):
         try:
             return func(*args, **kwargs)
         except APIError as exc:
-            message = str(exc)
-            if "429" in message and attempt < retries - 1:
+            if "429" in str(exc) and attempt < retries - 1:
                 wait = 20 + attempt * 15
                 print(f"Rate limit hit, waiting {wait}s...")
                 time.sleep(wait)
@@ -118,7 +117,6 @@ def canonical_header(value: Any) -> str:
         "meeting_date": ["meeting date", "date", "дата", "lesson date"],
         "duration": ["duration", "длительность"],
         "email": ["email", "почта"],
-        "activity_score": ["activity score", "активность"],
     }
     for key, variants in aliases.items():
         if normalized in variants:
@@ -222,7 +220,7 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
             errors.append([sheet_name, "", 'Missing column "ФИО ученика"'])
             continue
 
-        hash_updates = []
+        pending_hash_updates = []
         for row in rows:
             values = row["values"]
             name = str(values.get("name", "")).strip()
@@ -256,9 +254,9 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
             students[key] = record
 
             if not str(values.get("hash", "")).strip() and "hash" in header_map:
-                hash_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
+                pending_hash_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
 
-        for row_idx, col_idx, value in hash_updates:
+        for row_idx, col_idx, value in pending_hash_updates:
             gs_retry(worksheet.update_cell, row_idx, col_idx, value)
 
     return spreadsheet, students, errors
@@ -287,7 +285,8 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 continue
 
             ignored_indexes = {
-                idx for key, idx in header_map.items()
+                idx
+                for key, idx in header_map.items()
                 if key in {"hash", "name", "group", "product", "subject", "status", "link", "updated_at", "email"}
             }
             topic_columns = [
@@ -299,7 +298,6 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 continue
 
             course_label = detect_course_label(spreadsheet, worksheet.title)
-
             for row in rows:
                 student_name = str(row["values"].get("name", "")).strip()
                 if not student_name:
@@ -315,21 +313,25 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                     score = parse_numeric(raw_value)
                     if score is None:
                         continue
-                    topics.append({
-                        "topic": re.sub(r"\s+", " ", topic_header).strip(),
-                        "score": score,
-                    })
+                    topics.append(
+                        {
+                            "topic": re.sub(r"\s+", " ", topic_header).strip(),
+                            "score": score,
+                        }
+                    )
 
                 if not topics:
                     continue
 
                 average = round(sum(item["score"] for item in topics) / len(topics), 1)
-                students[key].courses.append({
-                    "course": course_label,
-                    "sheet": worksheet.title,
-                    "average": average,
-                    "topics": topics,
-                })
+                students[key].courses.append(
+                    {
+                        "course": course_label,
+                        "sheet": worksheet.title,
+                        "average": average,
+                        "topics": topics,
+                    }
+                )
 
 
 def normalize_attendance_status(status: str) -> str:
@@ -368,30 +370,31 @@ def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -
                 if key not in students:
                     continue
 
-                students[key].attendance_lessons.append({
-                    "date": str(values.get("meeting_date") or values.get("date") or ""),
-                    "lesson": str(values.get("meeting_name") or worksheet.title),
-                    "status": normalize_attendance_status(str(values.get("status", ""))),
-                    "duration": str(values.get("duration") or ""),
-                    "source": spreadsheet.title,
-                })
+                students[key].attendance_lessons.append(
+                    {
+                        "date": str(values.get("meeting_date") or values.get("date") or ""),
+                        "lesson": str(values.get("meeting_name") or worksheet.title or ""),
+                        "status": normalize_attendance_status(str(values.get("status", "")).strip()),
+                        "duration": str(values.get("duration") or ""),
+                        "source": spreadsheet.title,
+                    }
+                )
 
 
 def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]:
     generated_at = format_datetime(datetime.now(APP_TIMEZONE))
-    result = []
-
+    items = []
     for student in students.values():
         student.courses.sort(key=lambda item: (item["course"], item["sheet"]))
         student.attendance_lessons.sort(key=lambda item: str(item.get("date", "")), reverse=True)
 
-        total = len(student.attendance_lessons)
+        total_lessons = len(student.attendance_lessons)
         present = sum(1 for item in student.attendance_lessons if item["status"] == "Present")
         late = sum(1 for item in student.attendance_lessons if item["status"] == "Late")
         partial = sum(1 for item in student.attendance_lessons if item["status"] == "Partial")
         absent = sum(1 for item in student.attendance_lessons if item["status"] == "Absent")
-        attended = present + late + partial
-        attendance_rate = round((attended / total) * 100) if total else None
+        participated = present + late + partial
+        attendance_rate = round((participated / total_lessons) * 100) if total_lessons else None
 
         averages = [course["average"] for course in student.courses]
         overall_average = round(sum(averages) / len(averages), 1) if averages else None
@@ -402,7 +405,7 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
         student.subject = student.subject or student.product
         student.status = student.status or "Active"
         student.attendance_summary = {
-            "total_lessons": total,
+            "total_lessons": total_lessons,
             "present": present,
             "late": late,
             "partial": partial,
@@ -414,35 +417,35 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
                 "topic_count": topic_count,
                 "course_count": len(student.courses),
                 "attendance_rate": attendance_rate,
-                "lessons_tracked": total,
+                "lessons_tracked": total_lessons,
             },
         }
-        result.append(student)
+        items.append(student)
 
-    return sorted(result, key=lambda item: item.name.lower())
+    return sorted(items, key=lambda item: item.name.lower())
 
 
 def render_student_html(student: StudentRecord) -> str:
     summary = student.attendance_summary.get("summary", {})
-    courses_html = "".join(
+    course_sections = "".join(
         f"""
-        <section class="course-card">
-          <div class="course-head">
+        <section class="course-block">
+          <div class="course-meta">
             <div>
               <h3>{escape_html(course['course'])}</h3>
               <p>{escape_html(course['sheet'])}</p>
             </div>
-            <div class="badge">{course['average']}/100</div>
+            <div class="score-chip">{course['average']}/100</div>
           </div>
-          <div class="topic-list">
+          <div class="topic-grid">
             {''.join(f'<div class="topic-row"><span>{escape_html(topic["topic"])}</span><strong>{topic["score"]}</strong></div>' for topic in course["topics"])}
           </div>
         </section>
         """
         for course in student.courses
-    ) or '<section class="course-card empty">Оценки пока не найдены.</section>'
+    ) or '<section class="course-block empty-block">По этому ученику пока не найдено grades.</section>'
 
-    lessons_html = "".join(
+    lesson_rows = "".join(
         f"""
         <tr>
           <td>{escape_html(lesson['date']) or '—'}</td>
@@ -452,143 +455,439 @@ def render_student_html(student: StudentRecord) -> str:
         </tr>
         """
         for lesson in student.attendance_summary.get("lessons", [])
-    ) or '<tr><td colspan="4">Attendance пока не найден.</td></tr>'
+    ) or '<tr><td colspan="4">Attendance по ученику пока не найден.</td></tr>'
+
+    hero_subject = student.subject or student.product or "Student Report"
+    hero_product = student.product or student.subject or "Academic Progress"
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{escape_html(student.name)} — iqra kids</title>
+  <title>{escape_html(student.name)} • WeGlobal Reports</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {{
-      --blue: #59ade7;
-      --blue-dark: #3b97d5;
-      --pink: #ff6794;
-      --bg: #f4f8fd;
-      --card: #ffffff;
-      --text: #34465f;
-      --muted: #7d8ba1;
-      --line: #e3edf7;
-      --green: #69cd77;
-      --orange: #f3b54c;
-      --shadow: 0 16px 36px rgba(71, 120, 171, 0.12);
-      --radius: 22px;
+      --bg: #f5f5f7;
+      --panel: rgba(255, 255, 255, 0.82);
+      --panel-strong: #ffffff;
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: rgba(0, 0, 0, 0.08);
+      --accent: #0071e3;
+      --accent-soft: rgba(0, 113, 227, 0.10);
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --danger: #ff453a;
+      --shadow: 0 16px 40px rgba(0, 0, 0, 0.07);
+      --radius: 28px;
+      --radius-sm: 18px;
     }}
     * {{ box-sizing: border-box; }}
+    html {{ scroll-behavior: smooth; }}
     body {{
       margin: 0;
-      font-family: 'Nunito', sans-serif;
+      font-family: 'Inter', sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(89, 173, 231, 0.12), transparent 22%),
-        radial-gradient(circle at top right, rgba(255, 103, 148, 0.10), transparent 16%),
-        linear-gradient(180deg, #f8fbff 0%, var(--bg) 100%);
+        radial-gradient(circle at top left, rgba(0, 113, 227, 0.10), transparent 22%),
+        radial-gradient(circle at top right, rgba(255, 255, 255, 0.60), transparent 18%),
+        linear-gradient(180deg, #fbfbfd 0%, var(--bg) 100%);
     }}
-    .header {{
-      background: linear-gradient(135deg, var(--blue) 0%, var(--blue-dark) 100%);
-      color: white;
-      padding: 22px 16px 32px;
+    .topbar {{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(20px);
+      background: rgba(251, 251, 253, 0.72);
+      border-bottom: 1px solid var(--line);
     }}
-    .header-inner, .main, .footer {{ max-width: 820px; margin: 0 auto; }}
-    .header-inner {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; }}
-    .brand {{ font-size: 34px; font-weight: 900; letter-spacing: -0.03em; }}
-    .brand span {{ font-size: 17px; background: var(--pink); border-radius: 10px; padding: 4px 9px; margin-left: 4px; }}
-    .updated {{ text-align: right; font-size: 13px; font-weight: 700; }}
-    .updated strong {{ display: block; font-size: 22px; }}
-    .main {{ padding: 18px 16px 40px; }}
-    h1 {{ text-align: center; color: var(--blue); margin: 8px 0 20px; font-size: 38px; }}
-    .card, .course-card, .panel {{ background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); }}
-    .card {{ padding: 18px; margin-bottom: 16px; }}
-    .grid-2, .stats {{ display: grid; gap: 14px; }}
-    .grid-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-    .info span {{ display: block; font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: 800; margin-bottom: 4px; }}
-    .info strong {{ color: var(--blue); font-size: 24px; }}
-    .stats {{ grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 18px; }}
-    .stat {{ background: var(--card); border-radius: 18px; padding: 16px 12px; box-shadow: var(--shadow); text-align: center; border-bottom: 4px solid var(--blue); }}
-    .stat.orange {{ border-bottom-color: var(--orange); }}
-    .stat.green {{ border-bottom-color: var(--green); }}
-    .stat span {{ display: block; color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }}
-    .stat strong {{ display: block; margin-top: 6px; font-size: 34px; color: var(--blue-dark); }}
-    .layout {{ display: grid; gap: 16px; grid-template-columns: 1.2fr 0.8fr; }}
-    .panel {{ padding: 18px; }}
-    .panel-head, .course-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }}
-    .panel h2, .course-card h3 {{ margin: 0; }}
-    .course-card {{ padding: 18px; margin-bottom: 14px; }}
-    .course-head p {{ margin: 4px 0 0; color: var(--muted); }}
-    .badge {{ border-radius: 999px; background: #edf7ff; color: var(--blue-dark); padding: 8px 12px; font-weight: 900; white-space: nowrap; }}
-    .topic-list {{ display: grid; gap: 10px; }}
-    .topic-row {{ display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #f9fbfe; border: 1px solid var(--line); border-radius: 16px; }}
-    .mini-list {{ display: grid; gap: 10px; }}
-    .mini {{ background: #f9fbfe; border: 1px solid var(--line); border-radius: 16px; padding: 14px; }}
-    .mini strong {{ display: block; font-size: 24px; margin-top: 4px; }}
-    .mini span {{ color: var(--muted); font-size: 12px; text-transform: uppercase; font-weight: 800; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 520px; }}
-    .table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 16px; }}
-    th, td {{ padding: 12px 14px; text-align: left; border-top: 1px solid var(--line); }}
-    th {{ border-top: 0; background: #f1f8fe; color: var(--blue-dark); font-size: 12px; text-transform: uppercase; }}
-    .empty {{ color: var(--muted); }}
-    .footer {{ padding: 0 16px 28px; text-align: center; color: var(--muted); font-size: 13px; font-weight: 700; }}
-    @media (max-width: 860px) {{
-      .layout, .grid-2, .stats {{ grid-template-columns: 1fr; }}
-      h1 {{ font-size: 30px; }}
+    .topbar-inner, .hero, .section, .footer {{
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+    }}
+    .topbar-inner {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0;
+      gap: 16px;
+    }}
+    .brand {{
+      font-weight: 700;
+      font-size: 20px;
+      letter-spacing: -0.02em;
+    }}
+    .brand span {{ color: var(--muted); font-weight: 500; }}
+    .top-meta {{
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .hero {{
+      padding: 56px 0 26px;
+      text-align: center;
+    }}
+    .eyebrow {{
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin-bottom: 12px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: clamp(42px, 6vw, 72px);
+      line-height: 0.98;
+      letter-spacing: -0.05em;
+      font-weight: 800;
+    }}
+    .hero-copy {{
+      margin: 18px auto 0;
+      max-width: 760px;
+      font-size: clamp(20px, 2.4vw, 30px);
+      line-height: 1.2;
+      letter-spacing: -0.03em;
+      color: var(--muted);
+    }}
+    .hero-actions {{
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 24px;
+    }}
+    .btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 132px;
+      padding: 12px 20px;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 600;
+      transition: transform .18s ease, box-shadow .18s ease, background .18s ease;
+    }}
+    .btn.primary {{
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 10px 24px rgba(0, 113, 227, 0.24);
+    }}
+    .btn.secondary {{
+      color: var(--accent);
+      border: 1px solid rgba(0, 113, 227, 0.30);
+      background: rgba(255,255,255,0.75);
+    }}
+    .btn:hover {{
+      transform: translateY(-1px);
+    }}
+    .hero-panel {{
+      margin-top: 34px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.86) 0%, rgba(255,255,255,0.74) 100%);
+      border: 1px solid rgba(255,255,255,0.9);
+      border-radius: 36px;
+      box-shadow: var(--shadow);
+      padding: 28px;
+    }}
+    .identity-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      text-align: left;
+    }}
+    .identity-card {{
+      padding: 18px 18px 20px;
+      border-radius: 22px;
+      background: rgba(255,255,255,0.86);
+      border: 1px solid rgba(0,0,0,0.05);
+    }}
+    .label {{
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 10px;
+      font-weight: 600;
+    }}
+    .value {{
+      font-size: 24px;
+      line-height: 1.18;
+      letter-spacing: -0.03em;
+      font-weight: 700;
+    }}
+    .section {{
+      padding: 18px 0 64px;
+    }}
+    .stat-strip {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+    }}
+    .stat-card, .panel {{
+      background: var(--panel);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.88);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+    }}
+    .stat-card {{
+      padding: 22px 18px;
+      text-align: center;
+    }}
+    .stat-card .value {{
+      font-size: clamp(30px, 4vw, 44px);
+    }}
+    .content-grid {{
+      display: grid;
+      grid-template-columns: 1.16fr 0.84fr;
+      gap: 18px;
+      align-items: start;
+    }}
+    .panel {{
+      padding: 24px;
+    }}
+    .panel-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }}
+    .panel h2 {{
+      margin: 0;
+      font-size: clamp(26px, 2.4vw, 38px);
+      letter-spacing: -0.04em;
+      font-weight: 700;
+    }}
+    .panel-subtle {{
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .pill {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 68px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .course-block {{
+      padding: 22px;
+      border-radius: 24px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      margin-bottom: 14px;
+    }}
+    .course-meta {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }}
+    .course-meta h3 {{
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+    }}
+    .course-meta p {{
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .score-chip {{
+      background: #f0f6ff;
+      color: var(--accent);
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .topic-grid {{
+      display: grid;
+      gap: 10px;
+    }}
+    .topic-row {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      border-radius: 18px;
+      background: #fafafc;
+      border: 1px solid var(--line);
+      padding: 14px 16px;
+      font-size: 15px;
+    }}
+    .topic-row span {{
+      color: var(--text);
+      max-width: 82%;
+    }}
+    .topic-row strong {{
+      font-size: 15px;
+      font-weight: 700;
+    }}
+    .metric-list {{
+      display: grid;
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .metric-box {{
+      padding: 18px;
+      border-radius: 22px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+    }}
+    .metric-box .value {{
+      font-size: 36px;
+      margin-top: 6px;
+    }}
+    .table-wrap {{
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: var(--panel-strong);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 520px;
+    }}
+    th, td {{
+      padding: 14px 16px;
+      text-align: left;
+      border-top: 1px solid var(--line);
+      font-size: 14px;
+    }}
+    th {{
+      border-top: 0;
+      background: #fafafc;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .empty-block {{
+      color: var(--muted);
+    }}
+    .footer {{
+      padding-bottom: 40px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    @media (max-width: 980px) {{
+      .identity-grid, .stat-strip, .content-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .course-meta, .panel-head, .topbar-inner {{
+        flex-direction: column;
+        align-items: flex-start;
+      }}
+      .top-meta {{
+        gap: 8px;
+        flex-direction: column;
+        align-items: flex-start;
+      }}
     }}
   </style>
 </head>
 <body>
-  <header class="header">
-    <div class="header-inner">
-      <div class="brand">iqra <span>kids</span></div>
-      <div class="updated">Дата обновления<strong>{escape_html(student.updated_at)}</strong></div>
-    </div>
-  </header>
-  <main class="main">
-    <h1>Отчёт об успеваемости</h1>
-    <section class="card">
-      <div class="grid-2">
-        <div class="info"><span>ФИО</span><strong>{escape_html(student.name)}</strong></div>
-        <div class="info"><span>Предмет</span><strong>{escape_html(student.subject or student.product or '—')}</strong></div>
-        <div class="info"><span>Группа</span><strong>{escape_html(student.group or '—')}</strong></div>
-        <div class="info"><span>Product</span><strong>{escape_html(student.product or '—')}</strong></div>
-      </div>
-    </section>
-    <section class="stats">
-      <div class="stat"><span>Средний grade</span><strong>{summary.get('overall_average') if summary.get('overall_average') is not None else '—'}</strong></div>
-      <div class="stat orange"><span>Темы</span><strong>{summary.get('topic_count', 0)}</strong></div>
-      <div class="stat green"><span>Attendance</span><strong>{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</strong></div>
-      <div class="stat"><span>Уроки</span><strong>{summary.get('lessons_tracked', 0)}</strong></div>
-    </section>
-    <div class="layout">
-      <section class="panel">
-        <div class="panel-head"><h2>Курсы и оценки</h2><div class="badge">{summary.get('course_count', 0)} курс(ов)</div></div>
-        {courses_html}
-      </section>
-      <div>
-        <section class="panel">
-          <div class="panel-head"><h2>Attendance</h2><div class="badge">{student.attendance_summary.get('total_lessons', 0)} уроков</div></div>
-          <div class="mini-list">
-            <div class="mini"><span>Посещено</span><strong>{student.attendance_summary.get('present', 0)}</strong></div>
-            <div class="mini"><span>Late</span><strong>{student.attendance_summary.get('late', 0)}</strong></div>
-            <div class="mini"><span>Partial</span><strong>{student.attendance_summary.get('partial', 0)}</strong></div>
-            <div class="mini"><span>Absent</span><strong>{student.attendance_summary.get('absent', 0)}</strong></div>
-          </div>
-        </section>
-        <section class="panel">
-          <div class="panel-head"><h2>Последние уроки</h2></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Дата</th><th>Урок</th><th>Статус</th><th>Duration</th></tr></thead>
-              <tbody>{lessons_html}</tbody>
-            </table>
-          </div>
-        </section>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">WeGlobal <span>Reports</span></div>
+      <div class="top-meta">
+        <span>{escape_html(hero_product)}</span>
+        <span>Обновлено: {escape_html(student.updated_at)}</span>
       </div>
     </div>
-  </main>
-  <footer class="footer">© 2026 iqra kids • отчёт обновляется автоматически из Google Sheets</footer>
+  </div>
+
+  <section class="hero">
+    <div class="eyebrow">Student Performance Report</div>
+    <h1>{escape_html(student.name)}</h1>
+    <div class="hero-copy">{escape_html(hero_subject)}. Чистая сводка по успеваемости, посещаемости и прогрессу по курсам.</div>
+    <div class="hero-actions">
+      <a class="btn primary" href="#grades">Открыть grades</a>
+      <a class="btn secondary" href="#attendance">Открыть attendance</a>
+    </div>
+    <div class="hero-panel">
+      <div class="identity-grid">
+        <div class="identity-card"><span class="label">ФИО</span><div class="value">{escape_html(student.name)}</div></div>
+        <div class="identity-card"><span class="label">Группа</span><div class="value">{escape_html(student.group or '—')}</div></div>
+        <div class="identity-card"><span class="label">Product</span><div class="value">{escape_html(student.product or '—')}</div></div>
+        <div class="identity-card"><span class="label">Статус</span><div class="value">{escape_html(student.status or '—')}</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="stat-strip">
+      <div class="stat-card"><span class="label">Средний grade</span><div class="value">{summary.get('overall_average') if summary.get('overall_average') is not None else '—'}</div></div>
+      <div class="stat-card"><span class="label">Темы</span><div class="value">{summary.get('topic_count', 0)}</div></div>
+      <div class="stat-card"><span class="label">Attendance</span><div class="value">{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</div></div>
+      <div class="stat-card"><span class="label">Уроки</span><div class="value">{summary.get('lessons_tracked', 0)}</div></div>
+    </div>
+
+    <div class="content-grid">
+      <div class="panel" id="grades">
+        <div class="panel-head">
+          <div>
+            <h2>Courses & Grades</h2>
+            <div class="panel-subtle">Индивидуальные результаты по всем найденным курсам ученика.</div>
+          </div>
+          <div class="pill">{summary.get('course_count', 0)} курс(ов)</div>
+        </div>
+        {course_sections}
+      </div>
+
+      <div class="panel" id="attendance">
+        <div class="panel-head">
+          <div>
+            <h2>Attendance</h2>
+            <div class="panel-subtle">Сводка по посещаемости и последние найденные уроки.</div>
+          </div>
+          <div class="pill">{student.attendance_summary.get('total_lessons', 0)} уроков</div>
+        </div>
+
+        <div class="metric-list">
+          <div class="metric-box"><span class="label">Посещено</span><div class="value">{student.attendance_summary.get('present', 0)}</div></div>
+          <div class="metric-box"><span class="label">Late</span><div class="value">{student.attendance_summary.get('late', 0)}</div></div>
+          <div class="metric-box"><span class="label">Partial</span><div class="value">{student.attendance_summary.get('partial', 0)}</div></div>
+          <div class="metric-box"><span class="label">Absent</span><div class="value">{student.attendance_summary.get('absent', 0)}</div></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Урок</th>
+                <th>Статус</th>
+                <th>Duration</th>
+              </tr>
+            </thead>
+            <tbody>{lesson_rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="footer">© 2026 WeGlobal • Individual student report</div>
 </body>
 </html>
 """
@@ -597,12 +896,12 @@ def render_student_html(student: StudentRecord) -> str:
 def render_index_html(students: list[StudentRecord]) -> str:
     cards = "".join(
         f"""
-        <a class="card" href="./{student.hash}/">
+        <a class="student-card" href="./{student.hash}/">
           <div>
             <strong>{escape_html(student.name)}</strong>
             <span>{escape_html(student.group or 'Без группы')}</span>
           </div>
-          <div class="meta">
+          <div class="card-meta">
             <b>{student.attendance_summary.get('summary', {}).get('overall_average', '—')}</b>
             <small>grade</small>
           </div>
@@ -615,24 +914,118 @@ def render_index_html(students: list[StudentRecord]) -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>iqra kids reports</title>
+  <title>WeGlobal Reports</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    body {{ margin: 0; font-family: Arial, sans-serif; background: linear-gradient(180deg, #f7fbff 0%, #eef6fd 100%); color: #24405e; }}
-    .wrap {{ max-width: 980px; margin: 0 auto; padding: 40px 16px; }}
-    h1 {{ font-size: 36px; margin: 0 0 8px; color: #4babe7; }}
-    p {{ color: #70839a; }}
-    .grid {{ display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 24px; }}
-    .card {{ text-decoration: none; color: inherit; background: white; border-radius: 18px; padding: 18px; box-shadow: 0 16px 36px rgba(76, 132, 184, 0.10); display: flex; justify-content: space-between; gap: 12px; }}
-    .card strong {{ display: block; font-size: 18px; }}
-    .card span, .card small {{ color: #7a8ca2; }}
-    .meta {{ text-align: right; }}
-    .meta b {{ display: block; font-size: 24px; color: #4babe7; }}
+    body {{
+      margin: 0;
+      font-family: 'Inter', sans-serif;
+      color: #1d1d1f;
+      background: linear-gradient(180deg, #fbfbfd 0%, #f5f5f7 100%);
+    }}
+    .topbar {{
+      position: sticky;
+      top: 0;
+      backdrop-filter: blur(20px);
+      background: rgba(251, 251, 253, 0.72);
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+    }}
+    .topbar-inner, .hero, .grid-wrap {{
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+    }}
+    .topbar-inner {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0;
+    }}
+    .brand {{ font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }}
+    .brand span {{ color: #6e6e73; font-weight: 500; }}
+    .hero {{
+      text-align: center;
+      padding: 64px 0 24px;
+    }}
+    .eyebrow {{
+      color: #0071e3;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: clamp(42px, 6vw, 72px);
+      line-height: 0.98;
+      letter-spacing: -0.05em;
+    }}
+    .hero p {{
+      margin: 18px auto 0;
+      max-width: 760px;
+      color: #6e6e73;
+      font-size: clamp(20px, 2.4vw, 30px);
+      line-height: 1.2;
+      letter-spacing: -0.03em;
+    }}
+    .grid-wrap {{
+      padding-bottom: 54px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }}
+    .student-card {{
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      text-decoration: none;
+      color: inherit;
+      background: rgba(255,255,255,0.82);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.88);
+      border-radius: 24px;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.07);
+      padding: 20px;
+      transition: transform .18s ease, box-shadow .18s ease;
+    }}
+    .student-card:hover {{
+      transform: translateY(-2px);
+      box-shadow: 0 20px 48px rgba(0,0,0,0.10);
+    }}
+    .student-card strong {{
+      display: block;
+      font-size: 20px;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }}
+    .student-card span, .student-card small {{
+      color: #6e6e73;
+    }}
+    .card-meta {{
+      text-align: right;
+    }}
+    .card-meta b {{
+      display: block;
+      font-size: 28px;
+      color: #0071e3;
+    }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>iqra kids reports</h1>
-    <p>Обновлено: {escape_html(format_datetime(datetime.now(APP_TIMEZONE)))}</p>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">WeGlobal <span>Reports</span></div>
+      <div>Updated: {escape_html(format_datetime(datetime.now(APP_TIMEZONE)))}</div>
+    </div>
+  </div>
+  <section class="hero">
+    <div class="eyebrow">Student Performance Reports</div>
+    <h1>WeGlobal Reports</h1>
+    <p>Accurate individual report pages for each student, with grades and attendance separated by personal link.</p>
+  </section>
+  <div class="grid-wrap">
     <div class="grid">{cards}</div>
   </div>
 </body>
@@ -716,7 +1109,7 @@ def write_errors_sheet(spreadsheet, errors: list[list[str]]) -> None:
 
 
 def main() -> None:
-    print("=== Kundelik Reports: start ===")
+    print("=== WeGlobal Reports: start ===")
     gc = init_google_client()
     print("Google auth: OK")
 
@@ -736,7 +1129,7 @@ def main() -> None:
     update_registry_rows(students)
     write_errors_sheet(registry_spreadsheet, errors)
     print("Registry updated")
-    print("=== Kundelik Reports: done ===")
+    print("=== WeGlobal Reports: done ===")
 
 
 if __name__ == "__main__":
