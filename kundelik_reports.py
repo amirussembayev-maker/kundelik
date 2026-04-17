@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import gspread
+from gspread.exceptions import APIError, WorksheetNotFound
 
 
 APP_TIMEZONE = ZoneInfo(os.getenv("REPORT_TIMEZONE", "Asia/Almaty"))
@@ -36,7 +38,7 @@ ATTENDANCE_SOURCE_SPREADSHEET_IDS = [
 
 GRADE_SHEET_EXCLUDE = {
     item.strip().lower()
-    for item in (os.getenv("GRADE_SHEET_EXCLUDE") or "").split(",")
+    for item in (os.getenv("GRADE_SHEET_EXCLUDE") or "errors").split(",")
     if item.strip()
 }
 ATTENDANCE_SHEET_EXCLUDE = {
@@ -68,6 +70,20 @@ class StudentRecord:
     courses: list[dict[str, Any]] = field(default_factory=list)
     attendance_lessons: list[dict[str, Any]] = field(default_factory=list)
     attendance_summary: dict[str, Any] = field(default_factory=dict)
+
+
+def gs_retry(func, *args, retries=6, **kwargs):
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except APIError as exc:
+            message = str(exc)
+            if "429" in message and attempt < retries - 1:
+                wait = 20 + attempt * 15
+                print(f"Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def normalize_lookup(value: Any) -> str:
@@ -115,7 +131,7 @@ def score_header_row(row: list[str]) -> int:
 
 
 def read_table(worksheet) -> tuple[list[str], dict[str, int], list[dict[str, Any]]]:
-    values = worksheet.get_all_values()
+    values = gs_retry(worksheet.get_all_values)
     if not values:
         return [], {}, []
 
@@ -187,13 +203,20 @@ def init_google_client() -> gspread.Client:
 
 
 def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, StudentRecord], list[list[str]]]:
-    spreadsheet = gc.open_by_key(REGISTRY_SPREADSHEET_ID)
+    spreadsheet = gs_retry(gc.open_by_key, REGISTRY_SPREADSHEET_ID)
     students: dict[str, StudentRecord] = {}
     errors: list[list[str]] = []
 
     for sheet_name in REGISTRY_SHEET_NAMES:
-        worksheet = spreadsheet.worksheet(sheet_name)
+        try:
+            worksheet = gs_retry(spreadsheet.worksheet, sheet_name)
+        except WorksheetNotFound:
+            errors.append([sheet_name, "", "Registry sheet not found"])
+            continue
+
         _, header_map, rows = read_table(worksheet)
+        print(f"Registry sheet {sheet_name}: {len(rows)} rows")
+        print(f"Header map {sheet_name}: {header_map}")
 
         if "name" not in header_map:
             errors.append([sheet_name, "", 'Missing column "ФИО ученика"'])
@@ -236,7 +259,7 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
                 hash_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
 
         for row_idx, col_idx, value in hash_updates:
-            worksheet.update_cell(row_idx, col_idx, value)
+            gs_retry(worksheet.update_cell, row_idx, col_idx, value)
 
     return spreadsheet, students, errors
 
@@ -247,12 +270,19 @@ def detect_course_label(spreadsheet: gspread.Spreadsheet, sheet_name: str) -> st
 
 def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], errors: list[list[str]]) -> None:
     for spreadsheet_id in GRADE_SOURCE_SPREADSHEET_IDS:
-        spreadsheet = gc.open_by_key(spreadsheet_id)
-        for worksheet in spreadsheet.worksheets():
+        spreadsheet = gs_retry(gc.open_by_key, spreadsheet_id)
+        worksheets = gs_retry(spreadsheet.worksheets)
+
+        for worksheet in worksheets:
             if worksheet.title.lower() in GRADE_SHEET_EXCLUDE:
                 continue
 
-            headers, header_map, rows = read_table(worksheet)
+            try:
+                headers, header_map, rows = read_table(worksheet)
+            except APIError as exc:
+                errors.append([spreadsheet.title, worksheet.title, f"Read error: {exc}"])
+                continue
+
             if "name" not in header_map:
                 continue
 
@@ -317,8 +347,10 @@ def normalize_attendance_status(status: str) -> str:
 
 def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -> None:
     for spreadsheet_id in ATTENDANCE_SOURCE_SPREADSHEET_IDS:
-        spreadsheet = gc.open_by_key(spreadsheet_id)
-        for worksheet in spreadsheet.worksheets():
+        spreadsheet = gs_retry(gc.open_by_key, spreadsheet_id)
+        worksheets = gs_retry(spreadsheet.worksheets)
+
+        for worksheet in worksheets:
             if worksheet.title.lower() in ATTENDANCE_SHEET_EXCLUDE:
                 continue
 
@@ -337,7 +369,7 @@ def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -
                     continue
 
                 students[key].attendance_lessons.append({
-                    "date": str(values.get("meeting_date") or ""),
+                    "date": str(values.get("meeting_date") or values.get("date") or ""),
                     "lesson": str(values.get("meeting_name") or worksheet.title),
                     "status": normalize_attendance_status(str(values.get("status", ""))),
                     "duration": str(values.get("duration") or ""),
@@ -666,21 +698,21 @@ def update_registry_rows(students: list[StudentRecord]) -> None:
         link_col = registry.header_map.get("link")
         updated_col = registry.header_map.get("updated_at")
         if link_col is not None:
-            registry.worksheet.update_cell(registry.row_number, link_col + 1, student.link)
+            gs_retry(registry.worksheet.update_cell, registry.row_number, link_col + 1, student.link)
         if updated_col is not None:
-            registry.worksheet.update_cell(registry.row_number, updated_col + 1, student.updated_at)
+            gs_retry(registry.worksheet.update_cell, registry.row_number, updated_col + 1, student.updated_at)
 
 
 def write_errors_sheet(spreadsheet, errors: list[list[str]]) -> None:
     try:
-        worksheet = spreadsheet.worksheet(ERRORS_SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=ERRORS_SHEET_NAME, rows=1000, cols=3)
+        worksheet = gs_retry(spreadsheet.worksheet, ERRORS_SHEET_NAME)
+    except WorksheetNotFound:
+        worksheet = gs_retry(spreadsheet.add_worksheet, title=ERRORS_SHEET_NAME, rows=1000, cols=3)
 
     values = [["Sheet", "Student", "Error"]]
     values.extend(errors if errors else [["", "", "No errors"]])
-    worksheet.clear()
-    worksheet.update(f"A1:C{len(values)}", values)
+    gs_retry(worksheet.clear)
+    gs_retry(worksheet.update, f"A1:C{len(values)}", values)
 
 
 def main() -> None:
