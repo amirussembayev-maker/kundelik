@@ -115,7 +115,7 @@ def score_header_row(row: list[str]) -> int:
 
 
 def read_table(worksheet) -> tuple[list[str], dict[str, int], list[dict[str, Any]]]:
-    values = worksheet.get_all_display_values()
+    values = worksheet.get_all_values()
     if not values:
         return [], {}, []
 
