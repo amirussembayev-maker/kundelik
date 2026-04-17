@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -173,9 +174,18 @@ def parse_numeric(value: Any) -> float | None:
         return None
 
 
-def generate_hash() -> str:
-    seed = f"{datetime.now().timestamp()}-{os.getpid()}-{os.urandom(4).hex()}"
-    return seed.encode().hex()[:8]
+def make_unique_hash(name: str, used_hashes: set[str]) -> str:
+    while True:
+        seed = f"{name}|{datetime.now(APP_TIMEZONE).isoformat()}|{os.urandom(8).hex()}|{time.time_ns()}"
+        candidate = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+        if candidate not in used_hashes:
+            used_hashes.add(candidate)
+            return candidate
+
+
+def is_homework_topic(topic_name: str) -> bool:
+    normalized = normalize_lookup(topic_name)
+    return normalized.startswith("hw")
 
 
 def format_datetime(dt: datetime) -> str:
@@ -204,12 +214,13 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
     spreadsheet = gs_retry(gc.open_by_key, REGISTRY_SPREADSHEET_ID)
     students: dict[str, StudentRecord] = {}
     errors: list[list[str]] = []
+    used_hashes: set[str] = set()
 
     for sheet_name in REGISTRY_SHEET_NAMES:
         try:
             worksheet = gs_retry(spreadsheet.worksheet, sheet_name)
         except WorksheetNotFound:
-            errors.append([sheet_name, "", "Registry sheet not found"])
+            errors.append([sheet_name, "", "Не найден registry-лист"])
             continue
 
         _, header_map, rows = read_table(worksheet)
@@ -217,10 +228,10 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
         print(f"Header map {sheet_name}: {header_map}")
 
         if "name" not in header_map:
-            errors.append([sheet_name, "", 'Missing column "ФИО ученика"'])
+            errors.append([sheet_name, "", 'Не найдена колонка "ФИО ученика"'])
             continue
 
-        pending_hash_updates = []
+        pending_updates = []
         for row in rows:
             values = row["values"]
             name = str(values.get("name", "")).strip()
@@ -228,7 +239,15 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
                 continue
 
             key = normalize_name(name)
-            student_hash = str(values.get("hash", "")).strip() or generate_hash()
+
+            raw_hash = str(values.get("hash", "")).strip()
+            if not raw_hash or raw_hash in used_hashes:
+                student_hash = make_unique_hash(name, used_hashes)
+                if "hash" in header_map:
+                    pending_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
+            else:
+                student_hash = raw_hash
+                used_hashes.add(student_hash)
 
             record = StudentRecord(
                 hash=student_hash,
@@ -248,15 +267,12 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
             )
 
             if key in students:
-                errors.append([sheet_name, name, f"Duplicate student in registry. Already exists in {students[key].registry.sheet_name}"])
+                errors.append([sheet_name, name, f"Дубликат ученика в registry. Уже есть в {students[key].registry.sheet_name}"])
                 continue
 
             students[key] = record
 
-            if not str(values.get("hash", "")).strip() and "hash" in header_map:
-                pending_hash_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
-
-        for row_idx, col_idx, value in pending_hash_updates:
+        for row_idx, col_idx, value in pending_updates:
             gs_retry(worksheet.update_cell, row_idx, col_idx, value)
 
     return spreadsheet, students, errors
@@ -278,7 +294,7 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
             try:
                 headers, header_map, rows = read_table(worksheet)
             except APIError as exc:
-                errors.append([spreadsheet.title, worksheet.title, f"Read error: {exc}"])
+                errors.append([spreadsheet.title, worksheet.title, f"Ошибка чтения: {exc}"])
                 continue
 
             if "name" not in header_map:
@@ -289,6 +305,7 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 for key, idx in header_map.items()
                 if key in {"hash", "name", "group", "product", "subject", "status", "link", "updated_at", "email"}
             }
+
             topic_columns = [
                 (idx, header)
                 for idx, header in enumerate(headers)
@@ -298,6 +315,7 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 continue
 
             course_label = detect_course_label(spreadsheet, worksheet.title)
+
             for row in rows:
                 student_name = str(row["values"].get("name", "")).strip()
                 if not student_name:
@@ -324,12 +342,15 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                     continue
 
                 average = round(sum(item["score"] for item in topics) / len(topics), 1)
+                hw_count = sum(1 for item in topics if is_homework_topic(item["topic"]))
+
                 students[key].courses.append(
                     {
                         "course": course_label,
                         "sheet": worksheet.title,
                         "average": average,
                         "topics": topics,
+                        "hw_count": hw_count,
                     }
                 )
 
@@ -337,14 +358,14 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
 def normalize_attendance_status(status: str) -> str:
     normalized = normalize_lookup(status)
     if "late" in normalized and "left early" in normalized:
-        return "Late + Left early"
+        return "Опоздал и вышел раньше"
     if "late" in normalized:
-        return "Late"
+        return "Опоздал"
     if "left early" in normalized or "partial" in normalized:
-        return "Partial"
+        return "Частично"
     if "absent" in normalized or "missed" in normalized:
-        return "Absent"
-    return "Present"
+        return "Отсутствовал"
+    return "Посетил"
 
 
 def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -> None:
@@ -384,26 +405,27 @@ def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -
 def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]:
     generated_at = format_datetime(datetime.now(APP_TIMEZONE))
     items = []
+
     for student in students.values():
         student.courses.sort(key=lambda item: (item["course"], item["sheet"]))
         student.attendance_lessons.sort(key=lambda item: str(item.get("date", "")), reverse=True)
 
         total_lessons = len(student.attendance_lessons)
-        present = sum(1 for item in student.attendance_lessons if item["status"] == "Present")
-        late = sum(1 for item in student.attendance_lessons if item["status"] == "Late")
-        partial = sum(1 for item in student.attendance_lessons if item["status"] == "Partial")
-        absent = sum(1 for item in student.attendance_lessons if item["status"] == "Absent")
+        present = sum(1 for item in student.attendance_lessons if item["status"] == "Посетил")
+        late = sum(1 for item in student.attendance_lessons if item["status"] == "Опоздал")
+        partial = sum(1 for item in student.attendance_lessons if item["status"] == "Частично")
+        absent = sum(1 for item in student.attendance_lessons if item["status"] == "Отсутствовал")
         participated = present + late + partial
         attendance_rate = round((participated / total_lessons) * 100) if total_lessons else None
 
         averages = [course["average"] for course in student.courses]
         overall_average = round(sum(averages) / len(averages), 1) if averages else None
-        topic_count = sum(len(course["topics"]) for course in student.courses)
+        topic_count = sum(course.get("hw_count", 0) for course in student.courses)
 
         student.link = f"{BASE_URL}/{student.hash}/" if BASE_URL else student.link
         student.updated_at = generated_at
         student.subject = student.subject or student.product
-        student.status = student.status or "Active"
+        student.status = student.status or "Активный"
         student.attendance_summary = {
             "total_lessons": total_lessons,
             "present": present,
@@ -427,6 +449,7 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
 
 def render_student_html(student: StudentRecord) -> str:
     summary = student.attendance_summary.get("summary", {})
+
     course_sections = "".join(
         f"""
         <section class="course-block">
@@ -443,7 +466,7 @@ def render_student_html(student: StudentRecord) -> str:
         </section>
         """
         for course in student.courses
-    ) or '<section class="course-block empty-block">По этому ученику пока не найдено grades.</section>'
+    ) or '<section class="course-block empty-block">По этому ученику пока не найдены оценки.</section>'
 
     lesson_rows = "".join(
         f"""
@@ -455,10 +478,10 @@ def render_student_html(student: StudentRecord) -> str:
         </tr>
         """
         for lesson in student.attendance_summary.get("lessons", [])
-    ) or '<tr><td colspan="4">Attendance по ученику пока не найден.</td></tr>'
+    ) or '<tr><td colspan="4">Посещаемость по ученику пока не найдена.</td></tr>'
 
-    hero_subject = student.subject or student.product or "Student Report"
-    hero_product = student.product or student.subject or "Academic Progress"
+    hero_subject = student.subject or student.product or "Отчёт по ученику"
+    hero_product = student.product or student.subject or "Академический прогресс"
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -472,19 +495,15 @@ def render_student_html(student: StudentRecord) -> str:
   <style>
     :root {{
       --bg: #f5f5f7;
-      --panel: rgba(255, 255, 255, 0.82);
+      --panel: rgba(255, 255, 255, 0.86);
       --panel-strong: #ffffff;
       --text: #1d1d1f;
       --muted: #6e6e73;
       --line: rgba(0, 0, 0, 0.08);
       --accent: #0071e3;
       --accent-soft: rgba(0, 113, 227, 0.10);
-      --success: #34c759;
-      --warning: #ff9f0a;
-      --danger: #ff453a;
       --shadow: 0 16px 40px rgba(0, 0, 0, 0.07);
       --radius: 28px;
-      --radius-sm: 18px;
     }}
     * {{ box-sizing: border-box; }}
     html {{ scroll-behavior: smooth; }}
@@ -494,7 +513,6 @@ def render_student_html(student: StudentRecord) -> str:
       color: var(--text);
       background:
         radial-gradient(circle at top left, rgba(0, 113, 227, 0.10), transparent 22%),
-        radial-gradient(circle at top right, rgba(255, 255, 255, 0.60), transparent 18%),
         linear-gradient(180deg, #fbfbfd 0%, var(--bg) 100%);
     }}
     .topbar {{
@@ -502,7 +520,7 @@ def render_student_html(student: StudentRecord) -> str:
       top: 0;
       z-index: 10;
       backdrop-filter: blur(20px);
-      background: rgba(251, 251, 253, 0.72);
+      background: rgba(251, 251, 253, 0.78);
       border-bottom: 1px solid var(--line);
     }}
     .topbar-inner, .hero, .section, .footer {{
@@ -521,7 +539,10 @@ def render_student_html(student: StudentRecord) -> str:
       font-size: 20px;
       letter-spacing: -0.02em;
     }}
-    .brand span {{ color: var(--muted); font-weight: 500; }}
+    .brand span {{
+      color: var(--muted);
+      font-weight: 500;
+    }}
     .top-meta {{
       display: flex;
       gap: 20px;
@@ -537,7 +558,6 @@ def render_student_html(student: StudentRecord) -> str:
       color: var(--accent);
       font-size: 14px;
       font-weight: 600;
-      letter-spacing: -0.01em;
       margin-bottom: 12px;
     }}
     h1 {{
@@ -566,12 +586,12 @@ def render_student_html(student: StudentRecord) -> str:
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 132px;
+      min-width: 160px;
       padding: 12px 20px;
       border-radius: 999px;
       text-decoration: none;
       font-weight: 600;
-      transition: transform .18s ease, box-shadow .18s ease, background .18s ease;
+      transition: transform .18s ease, box-shadow .18s ease;
     }}
     .btn.primary {{
       background: var(--accent);
@@ -581,14 +601,14 @@ def render_student_html(student: StudentRecord) -> str:
     .btn.secondary {{
       color: var(--accent);
       border: 1px solid rgba(0, 113, 227, 0.30);
-      background: rgba(255,255,255,0.75);
+      background: rgba(255,255,255,0.80);
     }}
     .btn:hover {{
       transform: translateY(-1px);
     }}
     .hero-panel {{
       margin-top: 34px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.86) 0%, rgba(255,255,255,0.74) 100%);
+      background: linear-gradient(180deg, rgba(255,255,255,0.88) 0%, rgba(255,255,255,0.78) 100%);
       border: 1px solid rgba(255,255,255,0.9);
       border-radius: 36px;
       box-shadow: var(--shadow);
@@ -644,11 +664,9 @@ def render_student_html(student: StudentRecord) -> str:
     .stat-card .value {{
       font-size: clamp(30px, 4vw, 44px);
     }}
-    .content-grid {{
+    .stack {{
       display: grid;
-      grid-template-columns: 1.16fr 0.84fr;
       gap: 18px;
-      align-items: start;
     }}
     .panel {{
       padding: 24px;
@@ -732,15 +750,11 @@ def render_student_html(student: StudentRecord) -> str:
       font-size: 15px;
     }}
     .topic-row span {{
-      color: var(--text);
       max-width: 82%;
-    }}
-    .topic-row strong {{
-      font-size: 15px;
-      font-weight: 700;
     }}
     .metric-list {{
       display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
       margin-bottom: 18px;
     }}
@@ -790,7 +804,7 @@ def render_student_html(student: StudentRecord) -> str:
       font-size: 13px;
     }}
     @media (max-width: 980px) {{
-      .identity-grid, .stat-strip, .content-grid {{
+      .identity-grid, .stat-strip, .metric-list {{
         grid-template-columns: 1fr;
       }}
       .course-meta, .panel-head, .topbar-inner {{
@@ -817,18 +831,18 @@ def render_student_html(student: StudentRecord) -> str:
   </div>
 
   <section class="hero">
-    <div class="eyebrow">Student Performance Report</div>
+    <div class="eyebrow">Индивидуальный отчёт по ученику</div>
     <h1>{escape_html(student.name)}</h1>
-    <div class="hero-copy">{escape_html(hero_subject)}. Чистая сводка по успеваемости, посещаемости и прогрессу по курсам.</div>
+    <div class="hero-copy">{escape_html(hero_subject)}. Аккуратная сводка по успеваемости, выполненным заданиям и посещаемости.</div>
     <div class="hero-actions">
-      <a class="btn primary" href="#grades">Открыть grades</a>
-      <a class="btn secondary" href="#attendance">Открыть attendance</a>
+      <a class="btn primary" href="#ocenki">Открыть оценки</a>
+      <a class="btn secondary" href="#poseshchaemost">Открыть посещаемость</a>
     </div>
     <div class="hero-panel">
       <div class="identity-grid">
         <div class="identity-card"><span class="label">ФИО</span><div class="value">{escape_html(student.name)}</div></div>
         <div class="identity-card"><span class="label">Группа</span><div class="value">{escape_html(student.group or '—')}</div></div>
-        <div class="identity-card"><span class="label">Product</span><div class="value">{escape_html(student.product or '—')}</div></div>
+        <div class="identity-card"><span class="label">Продукт</span><div class="value">{escape_html(student.product or '—')}</div></div>
         <div class="identity-card"><span class="label">Статус</span><div class="value">{escape_html(student.status or '—')}</div></div>
       </div>
     </div>
@@ -838,15 +852,15 @@ def render_student_html(student: StudentRecord) -> str:
     <div class="stat-strip">
       <div class="stat-card"><span class="label">Средний grade</span><div class="value">{summary.get('overall_average') if summary.get('overall_average') is not None else '—'}</div></div>
       <div class="stat-card"><span class="label">Темы</span><div class="value">{summary.get('topic_count', 0)}</div></div>
-      <div class="stat-card"><span class="label">Attendance</span><div class="value">{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</div></div>
+      <div class="stat-card"><span class="label">Посещаемость</span><div class="value">{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</div></div>
       <div class="stat-card"><span class="label">Уроки</span><div class="value">{summary.get('lessons_tracked', 0)}</div></div>
     </div>
 
-    <div class="content-grid">
-      <div class="panel" id="grades">
+    <div class="stack">
+      <div class="panel" id="ocenki">
         <div class="panel-head">
           <div>
-            <h2>Courses & Grades</h2>
+            <h2>Курсы и оценки</h2>
             <div class="panel-subtle">Индивидуальные результаты по всем найденным курсам ученика.</div>
           </div>
           <div class="pill">{summary.get('course_count', 0)} курс(ов)</div>
@@ -854,10 +868,10 @@ def render_student_html(student: StudentRecord) -> str:
         {course_sections}
       </div>
 
-      <div class="panel" id="attendance">
+      <div class="panel" id="poseshchaemost">
         <div class="panel-head">
           <div>
-            <h2>Attendance</h2>
+            <h2>Посещаемость</h2>
             <div class="panel-subtle">Сводка по посещаемости и последние найденные уроки.</div>
           </div>
           <div class="pill">{student.attendance_summary.get('total_lessons', 0)} уроков</div>
@@ -865,9 +879,9 @@ def render_student_html(student: StudentRecord) -> str:
 
         <div class="metric-list">
           <div class="metric-box"><span class="label">Посещено</span><div class="value">{student.attendance_summary.get('present', 0)}</div></div>
-          <div class="metric-box"><span class="label">Late</span><div class="value">{student.attendance_summary.get('late', 0)}</div></div>
-          <div class="metric-box"><span class="label">Partial</span><div class="value">{student.attendance_summary.get('partial', 0)}</div></div>
-          <div class="metric-box"><span class="label">Absent</span><div class="value">{student.attendance_summary.get('absent', 0)}</div></div>
+          <div class="metric-box"><span class="label">Опоздал</span><div class="value">{student.attendance_summary.get('late', 0)}</div></div>
+          <div class="metric-box"><span class="label">Частично</span><div class="value">{student.attendance_summary.get('partial', 0)}</div></div>
+          <div class="metric-box"><span class="label">Отсутствовал</span><div class="value">{student.attendance_summary.get('absent', 0)}</div></div>
         </div>
 
         <div class="table-wrap">
@@ -887,7 +901,7 @@ def render_student_html(student: StudentRecord) -> str:
     </div>
   </section>
 
-  <div class="footer">© 2026 WeGlobal • Individual student report</div>
+  <div class="footer">© 2026 WeGlobal • Индивидуальный отчёт ученика</div>
 </body>
 </html>
 """
@@ -1017,13 +1031,13 @@ def render_index_html(students: list[StudentRecord]) -> str:
   <div class="topbar">
     <div class="topbar-inner">
       <div class="brand">WeGlobal <span>Reports</span></div>
-      <div>Updated: {escape_html(format_datetime(datetime.now(APP_TIMEZONE)))}</div>
+      <div>Обновлено: {escape_html(format_datetime(datetime.now(APP_TIMEZONE)))}</div>
     </div>
   </div>
   <section class="hero">
-    <div class="eyebrow">Student Performance Reports</div>
+    <div class="eyebrow">Индивидуальные отчёты учеников</div>
     <h1>WeGlobal Reports</h1>
-    <p>Accurate individual report pages for each student, with grades and attendance separated by personal link.</p>
+    <p>Аккуратные персональные страницы по каждому ученику с отдельной ссылкой, оценками и посещаемостью.</p>
   </section>
   <div class="grid-wrap">
     <div class="grid">{cards}</div>
