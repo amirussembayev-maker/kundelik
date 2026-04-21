@@ -48,6 +48,21 @@ ATTENDANCE_SHEET_EXCLUDE = {
     if item.strip()
 }
 
+MONTH_NAMES_RU = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
+
 
 @dataclass
 class RegistryRow:
@@ -174,18 +189,78 @@ def parse_numeric(value: Any) -> float | None:
         return None
 
 
-def make_unique_hash(name: str, used_hashes: set[str]) -> str:
-    while True:
-        seed = f"{name}|{datetime.now(APP_TIMEZONE).isoformat()}|{os.urandom(8).hex()}|{time.time_ns()}"
-        candidate = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
-        if candidate not in used_hashes:
-            used_hashes.add(candidate)
-            return candidate
+def parse_datetime_value(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return None
+    patterns = [
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%m/%d/%Y, %I:%M:%S %p",
+        "%m/%d/%Y, %I:%M %p",
+    ]
+    for pattern in patterns:
+        try:
+            return datetime.strptime(text, pattern).replace(tzinfo=APP_TIMEZONE)
+        except ValueError:
+            continue
+    return None
 
 
-def is_homework_topic(topic_name: str) -> bool:
-    normalized = normalize_lookup(topic_name)
-    return normalized.startswith("hw")
+def extract_lesson_datetime_from_title(title: str) -> datetime | None:
+    match = re.search(r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})", str(title))
+    if match:
+        return parse_datetime_value(match.group(1))
+    return None
+
+
+def round_ielts_band(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value * 2) / 2
+
+
+def format_number(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, int):
+        return str(value)
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def month_key_to_label(month_key: str) -> str:
+    parts = month_key.split("-")
+    if len(parts) != 2:
+        return month_key
+    year = int(parts[0])
+    month = int(parts[1])
+    return f"{MONTH_NAMES_RU.get(month, month_key)} {year}"
+
+
+def month_key_from_datetime(dt: datetime | None) -> str:
+    if not dt:
+        return "Без даты"
+    return dt.strftime("%Y-%m")
+
+
+def status_to_ru(status: str) -> str:
+    normalized = normalize_lookup(status)
+    if "late" in normalized and "left early" in normalized:
+        return "Опоздал и вышел раньше"
+    if "late" in normalized:
+        return "Опоздал"
+    if "left early" in normalized or "partial" in normalized:
+        return "Частично"
+    if "absent" in normalized or "missed" in normalized:
+        return "Отсутствовал"
+    if "teacher" in normalized:
+        return "Преподаватель"
+    return "Посетил"
 
 
 def format_datetime(dt: datetime) -> str:
@@ -201,6 +276,15 @@ def escape_html(value: Any) -> str:
         .replace('"', "&quot;")
         .replace("'", "&#39;")
     )
+
+
+def build_unique_hash(name: str, used_hashes: set[str]) -> str:
+    while True:
+        seed = f"{name}|{datetime.now(APP_TIMEZONE).isoformat()}|{os.urandom(8).hex()}|{time.time_ns()}"
+        candidate = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+        if candidate not in used_hashes:
+            used_hashes.add(candidate)
+            return candidate
 
 
 def init_google_client() -> gspread.Client:
@@ -239,10 +323,9 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
                 continue
 
             key = normalize_name(name)
-
             raw_hash = str(values.get("hash", "")).strip()
             if not raw_hash or raw_hash in used_hashes:
-                student_hash = make_unique_hash(name, used_hashes)
+                student_hash = build_unique_hash(name, used_hashes)
                 if "hash" in header_map:
                     pending_updates.append((row["row_number"], header_map["hash"] + 1, student_hash))
             else:
@@ -278,14 +361,178 @@ def build_registry(gc: gspread.Client) -> tuple[gspread.Spreadsheet, dict[str, S
     return spreadsheet, students, errors
 
 
-def detect_course_label(spreadsheet: gspread.Spreadsheet, sheet_name: str) -> str:
-    return spreadsheet.title.strip() or sheet_name
+def course_display_name(spreadsheet_title: str) -> str:
+    normalized = normalize_lookup(spreadsheet_title)
+    if "ielts mock new" in normalized or "ielts mock" in normalized:
+        return "IELTS MOCK TESTS"
+    if "_mock" in normalized or "progress report mock" in normalized:
+        return "NUET MOCK TESTS"
+    return spreadsheet_title.strip()
+
+
+def extract_sort_tuple(title: str) -> tuple[int, int, str]:
+    normalized = normalize_lookup(title)
+    hw_match = re.search(r"\bhw\s*(\d+)", normalized)
+    mock_match = re.search(r"\bmock\s*(\d+)", normalized)
+    if hw_match:
+        return (0, int(hw_match.group(1)), normalized)
+    if mock_match:
+        return (1, int(mock_match.group(1)), normalized)
+    return (2, 9999, normalized)
+
+
+def parse_mock_header(header: str) -> tuple[int | None, str]:
+    normalized = re.sub(r"\s+", " ", str(header).strip())
+    match = re.search(r"MOCK\s*(\d+)\s*\|\s*(.+)", normalized, re.IGNORECASE)
+    if not match:
+        return None, normalized
+    mock_no = int(match.group(1))
+    part = match.group(2).strip()
+    return mock_no, part
+
+
+def normalize_mock_part(part: str) -> str:
+    normalized = normalize_lookup(part)
+    if "read" in normalized:
+        return "reading"
+    if "liste" in normalized:
+        return "listening"
+    if "writi" in normalized:
+        return "writing"
+    if "spea" in normalized:
+        return "speaking"
+    if "over" in normalized:
+        return "overall"
+    if "critic" in normalized:
+        return "critic"
+    if "math" in normalized:
+        return "math"
+    return normalized
+
+
+def build_general_course(spreadsheet, worksheet, row, topic_columns):
+    topics = []
+    for index, topic_header in topic_columns:
+        raw_value = row["raw"][index] if index < len(row["raw"]) else ""
+        score = parse_numeric(raw_value)
+        if score is None:
+            continue
+        topics.append(
+            {
+                "topic": re.sub(r"\s+", " ", topic_header).strip(),
+                "score": score,
+                "sort_key": extract_sort_tuple(topic_header),
+                "is_hw": normalize_lookup(topic_header).startswith("hw"),
+                "is_mock": normalize_lookup(topic_header).startswith("mock"),
+            }
+        )
+
+    if not topics:
+        return None
+
+    topics.sort(key=lambda item: item["sort_key"])
+    homework_topics = [item for item in topics if item["is_hw"]]
+    average = round(sum(item["score"] for item in homework_topics) / len(homework_topics), 1) if homework_topics else None
+
+    return {
+        "kind": "homework",
+        "course": course_display_name(spreadsheet.title),
+        "sheet": worksheet.title,
+        "average": average,
+        "topics": topics,
+        "homework_count": len(homework_topics),
+        "mock_count": 0,
+    }
+
+
+def build_ielts_mock_course(spreadsheet, worksheet, row, topic_columns):
+    mocks: dict[int, dict[str, Any]] = {}
+    for index, topic_header in topic_columns:
+        raw_value = row["raw"][index] if index < len(row["raw"]) else ""
+        score = parse_numeric(raw_value)
+        if score is None:
+            continue
+        mock_no, part = parse_mock_header(topic_header)
+        if mock_no is None:
+            continue
+        bucket = mocks.setdefault(
+            mock_no,
+            {
+                "number": mock_no,
+                "reading": None,
+                "listening": None,
+                "writing": None,
+                "speaking": None,
+                "overall": None,
+            },
+        )
+        bucket[normalize_mock_part(part)] = score
+
+    if not mocks:
+        return None
+
+    mock_items = []
+    overall_values = []
+    for mock_no in sorted(mocks):
+        item = mocks[mock_no]
+        if item.get("overall") is not None:
+            overall_values.append(item["overall"])
+        else:
+            parts = [item.get(name) for name in ("reading", "listening", "writing", "speaking") if item.get(name) is not None]
+            if parts:
+                item["overall"] = round_ielts_band(sum(parts) / len(parts))
+                overall_values.append(item["overall"])
+        mock_items.append(item)
+
+    average_band = round_ielts_band(sum(overall_values) / len(overall_values)) if overall_values else None
+
+    return {
+        "kind": "ielts_mock",
+        "course": "IELTS MOCK TESTS",
+        "sheet": worksheet.title,
+        "average_band": average_band,
+        "mock_count": len(mock_items),
+        "mocks": mock_items,
+        "average": None,
+        "homework_count": 0,
+    }
+
+
+def build_nuet_mock_course(spreadsheet, worksheet, row, topic_columns):
+    mocks: dict[int, dict[str, Any]] = {}
+    for index, topic_header in topic_columns:
+        raw_value = row["raw"][index] if index < len(row["raw"]) else ""
+        score = parse_numeric(raw_value)
+        if score is None:
+            continue
+        mock_no, part = parse_mock_header(topic_header)
+        if mock_no is None:
+            continue
+        bucket = mocks.setdefault(mock_no, {"number": mock_no, "critic": None, "math": None})
+        bucket[normalize_mock_part(part)] = score
+
+    if not mocks:
+        return None
+
+    mock_items = [mocks[number] for number in sorted(mocks)]
+    return {
+        "kind": "nuet_mock",
+        "course": "NUET MOCK TESTS",
+        "sheet": worksheet.title,
+        "mock_count": len(mock_items),
+        "mocks": mock_items,
+        "average": None,
+        "homework_count": 0,
+    }
 
 
 def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], errors: list[list[str]]) -> None:
     for spreadsheet_id in GRADE_SOURCE_SPREADSHEET_IDS:
         spreadsheet = gs_retry(gc.open_by_key, spreadsheet_id)
         worksheets = gs_retry(spreadsheet.worksheets)
+        title_normalized = normalize_lookup(spreadsheet.title)
+        is_ielts_mock_book = "ielts mock" in title_normalized
+        is_nuet_mock_book = "_mock" in title_normalized or "progress report mock" in title_normalized
 
         for worksheet in worksheets:
             if worksheet.title.lower() in GRADE_SHEET_EXCLUDE:
@@ -305,7 +552,6 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 for key, idx in header_map.items()
                 if key in {"hash", "name", "group", "product", "subject", "status", "link", "updated_at", "email"}
             }
-
             topic_columns = [
                 (idx, header)
                 for idx, header in enumerate(headers)
@@ -313,8 +559,6 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
             ]
             if not topic_columns:
                 continue
-
-            course_label = detect_course_label(spreadsheet, worksheet.title)
 
             for row in rows:
                 student_name = str(row["values"].get("name", "")).strip()
@@ -325,47 +569,15 @@ def collect_grades(gc: gspread.Client, students: dict[str, StudentRecord], error
                 if key not in students:
                     continue
 
-                topics = []
-                for index, topic_header in topic_columns:
-                    raw_value = row["raw"][index] if index < len(row["raw"]) else ""
-                    score = parse_numeric(raw_value)
-                    if score is None:
-                        continue
-                    topics.append(
-                        {
-                            "topic": re.sub(r"\s+", " ", topic_header).strip(),
-                            "score": score,
-                        }
-                    )
+                if is_ielts_mock_book:
+                    course = build_ielts_mock_course(spreadsheet, worksheet, row, topic_columns)
+                elif is_nuet_mock_book:
+                    course = build_nuet_mock_course(spreadsheet, worksheet, row, topic_columns)
+                else:
+                    course = build_general_course(spreadsheet, worksheet, row, topic_columns)
 
-                if not topics:
-                    continue
-
-                average = round(sum(item["score"] for item in topics) / len(topics), 1)
-                hw_count = sum(1 for item in topics if is_homework_topic(item["topic"]))
-
-                students[key].courses.append(
-                    {
-                        "course": course_label,
-                        "sheet": worksheet.title,
-                        "average": average,
-                        "topics": topics,
-                        "hw_count": hw_count,
-                    }
-                )
-
-
-def normalize_attendance_status(status: str) -> str:
-    normalized = normalize_lookup(status)
-    if "late" in normalized and "left early" in normalized:
-        return "Опоздал и вышел раньше"
-    if "late" in normalized:
-        return "Опоздал"
-    if "left early" in normalized or "partial" in normalized:
-        return "Частично"
-    if "absent" in normalized or "missed" in normalized:
-        return "Отсутствовал"
-    return "Посетил"
+                if course:
+                    students[key].courses.append(course)
 
 
 def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -> None:
@@ -378,26 +590,42 @@ def collect_attendance(gc: gspread.Client, students: dict[str, StudentRecord]) -
                 continue
 
             _, header_map, rows = read_table(worksheet)
-            if "name" not in header_map or "status" not in header_map:
+            if "name" not in header_map:
                 continue
+
+            current_lesson_name = worksheet.title
+            current_lesson_dt = extract_lesson_datetime_from_title(worksheet.title)
 
             for row in rows:
                 values = row["values"]
-                student_name = str(values.get("name", "")).strip()
-                if not student_name:
+                name_value = str(values.get("name", "")).strip()
+                role_value = str(values.get("role", "")).strip()
+
+                if name_value and "|" in name_value and not role_value:
+                    current_lesson_name = name_value
+                    current_lesson_dt = extract_lesson_datetime_from_title(name_value) or current_lesson_dt
                     continue
 
-                key = normalize_name(student_name)
+                if not name_value:
+                    continue
+
+                key = normalize_name(name_value)
                 if key not in students:
                     continue
 
+                lesson_dt = parse_datetime_value(str(values.get("meeting_date") or values.get("date") or "")) or current_lesson_dt
+                lesson_name = str(values.get("meeting_name") or current_lesson_name or worksheet.title)
+                status = status_to_ru(str(values.get("status", "")).strip())
+                duration = str(values.get("duration") or "")
+
                 students[key].attendance_lessons.append(
                     {
-                        "date": str(values.get("meeting_date") or values.get("date") or ""),
-                        "lesson": str(values.get("meeting_name") or worksheet.title or ""),
-                        "status": normalize_attendance_status(str(values.get("status", "")).strip()),
-                        "duration": str(values.get("duration") or ""),
+                        "date": lesson_dt.strftime("%d.%m.%Y %H:%M") if lesson_dt else "—",
+                        "lesson": lesson_name,
+                        "status": status,
+                        "duration": duration,
                         "source": spreadsheet.title,
+                        "month_key": month_key_from_datetime(lesson_dt),
                     }
                 )
 
@@ -407,8 +635,11 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
     items = []
 
     for student in students.values():
-        student.courses.sort(key=lambda item: (item["course"], item["sheet"]))
-        student.attendance_lessons.sort(key=lambda item: str(item.get("date", "")), reverse=True)
+        student.courses.sort(key=lambda item: (item["kind"], item["course"], item["sheet"]))
+        student.attendance_lessons.sort(
+            key=lambda item: (item.get("month_key", ""), item.get("date", "")),
+            reverse=True,
+        )
 
         total_lessons = len(student.attendance_lessons)
         present = sum(1 for item in student.attendance_lessons if item["status"] == "Посетил")
@@ -418,9 +649,15 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
         participated = present + late + partial
         attendance_rate = round((participated / total_lessons) * 100) if total_lessons else None
 
-        averages = [course["average"] for course in student.courses]
-        overall_average = round(sum(averages) / len(averages), 1) if averages else None
-        topic_count = sum(course.get("hw_count", 0) for course in student.courses)
+        homework_courses = [course for course in student.courses if course["kind"] == "homework" and course.get("average") is not None]
+        homework_averages = [course["average"] for course in homework_courses if course.get("average") is not None]
+        overall_average = round(sum(homework_averages) / len(homework_averages), 1) if homework_averages else None
+        topic_count = sum(course.get("homework_count", 0) for course in homework_courses)
+        mock_count = sum(course.get("mock_count", 0) for course in student.courses if course["kind"] in {"ielts_mock", "nuet_mock"})
+
+        monthly_summary: dict[str, list[dict[str, Any]]] = {}
+        for lesson in student.attendance_lessons:
+            monthly_summary.setdefault(lesson["month_key"], []).append(lesson)
 
         student.link = f"{BASE_URL}/{student.hash}/" if BASE_URL else student.link
         student.updated_at = generated_at
@@ -433,10 +670,12 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
             "partial": partial,
             "absent": absent,
             "attendance_rate": attendance_rate,
-            "lessons": student.attendance_lessons[:15],
+            "lessons": student.attendance_lessons[:20],
+            "monthly": monthly_summary,
             "summary": {
                 "overall_average": overall_average,
                 "topic_count": topic_count,
+                "mock_count": mock_count,
                 "course_count": len(student.courses),
                 "attendance_rate": attendance_rate,
                 "lessons_tracked": total_lessons,
@@ -447,31 +686,97 @@ def finalize_students(students: dict[str, StudentRecord]) -> list[StudentRecord]
     return sorted(items, key=lambda item: item.name.lower())
 
 
+def render_homework_course(course: dict[str, Any]) -> str:
+    topic_rows = "".join(
+        f'<div class="topic-row"><span>{escape_html(topic["topic"])}</span><strong>{format_number(topic["score"])}</strong></div>'
+        for topic in course["topics"]
+    )
+    return f"""
+    <section class="course-block">
+      <div class="course-meta">
+        <div>
+          <h3>{escape_html(course['course'])}</h3>
+          <p>{escape_html(course['sheet'])}</p>
+        </div>
+        <div class="score-chip">{format_number(course['average'])}/100</div>
+      </div>
+      <div class="topic-grid">{topic_rows}</div>
+    </section>
+    """
+
+
+def render_ielts_mock_course(course: dict[str, Any]) -> str:
+    mock_rows = []
+    for mock in course["mocks"]:
+        for part_key, label in (
+            ("reading", "Reading"),
+            ("listening", "Listening"),
+            ("writing", "Writing"),
+            ("speaking", "Speaking"),
+        ):
+            value = mock.get(part_key)
+            mock_rows.append(
+                f'<div class="mock-part"><span>Mock {mock["number"]} • {label}</span><strong>{format_number(value) if value is not None else "Не сдавал"}</strong></div>'
+            )
+        mock_rows.append(
+            f'<div class="mock-part total"><span>Mock {mock["number"]} • Итоговый band</span><strong>{format_number(mock.get("overall")) if mock.get("overall") is not None else "Не сдавал"}</strong></div>'
+        )
+
+    return f"""
+    <section class="course-block mock-block">
+      <div class="course-meta">
+        <div>
+          <h3>{escape_html(course['course'])}</h3>
+          <p>{escape_html(course['sheet'])}</p>
+        </div>
+        <div class="score-chip">{format_number(course.get('average_band')) if course.get('average_band') is not None else '—'} band</div>
+      </div>
+      <div class="mock-grid">{''.join(mock_rows)}</div>
+    </section>
+    """
+
+
+def render_nuet_mock_course(course: dict[str, Any]) -> str:
+    mock_rows = []
+    for mock in course["mocks"]:
+        mock_rows.append(
+            f'<div class="mock-part"><span>Mock {mock["number"]} • Critic</span><strong>{format_number(mock.get("critic")) if mock.get("critic") is not None else "Не сдавал"}</strong></div>'
+        )
+        mock_rows.append(
+            f'<div class="mock-part"><span>Mock {mock["number"]} • Math</span><strong>{format_number(mock.get("math")) if mock.get("math") is not None else "Не сдавал"}</strong></div>'
+        )
+
+    return f"""
+    <section class="course-block mock-block">
+      <div class="course-meta">
+        <div>
+          <h3>{escape_html(course['course'])}</h3>
+          <p>{escape_html(course['sheet'])}</p>
+        </div>
+        <div class="score-chip">{course.get('mock_count', 0)} mock</div>
+      </div>
+      <div class="mock-grid">{''.join(mock_rows)}</div>
+    </section>
+    """
+
+
 def render_student_html(student: StudentRecord) -> str:
     summary = student.attendance_summary.get("summary", {})
 
-    course_sections = "".join(
-        f"""
-        <section class="course-block">
-          <div class="course-meta">
-            <div>
-              <h3>{escape_html(course['course'])}</h3>
-              <p>{escape_html(course['sheet'])}</p>
-            </div>
-            <div class="score-chip">{course['average']}/100</div>
-          </div>
-          <div class="topic-grid">
-            {''.join(f'<div class="topic-row"><span>{escape_html(topic["topic"])}</span><strong>{topic["score"]}</strong></div>' for topic in course["topics"])}
-          </div>
-        </section>
-        """
+    homework_html = "".join(render_homework_course(course) for course in student.courses if course["kind"] == "homework")
+    homework_html = homework_html or '<section class="course-block empty-block">По этому ученику пока не найдены домашние задания.</section>'
+
+    mock_html = "".join(
+        render_ielts_mock_course(course) if course["kind"] == "ielts_mock" else render_nuet_mock_course(course)
         for course in student.courses
-    ) or '<section class="course-block empty-block">По этому ученику пока не найдены оценки.</section>'
+        if course["kind"] in {"ielts_mock", "nuet_mock"}
+    )
+    mock_html = mock_html or '<section class="course-block empty-block">По этому ученику пока не найдены mock tests.</section>'
 
     lesson_rows = "".join(
         f"""
         <tr>
-          <td>{escape_html(lesson['date']) or '—'}</td>
+          <td>{escape_html(lesson['date'])}</td>
           <td>{escape_html(lesson['lesson'])}</td>
           <td>{escape_html(lesson['status'])}</td>
           <td>{escape_html(lesson['duration']) or '—'}</td>
@@ -480,8 +785,125 @@ def render_student_html(student: StudentRecord) -> str:
         for lesson in student.attendance_summary.get("lessons", [])
     ) or '<tr><td colspan="4">Посещаемость по ученику пока не найдена.</td></tr>'
 
+    month_cards = []
+    for month_key in sorted(student.attendance_summary.get("monthly", {}).keys(), reverse=True):
+        lessons = student.attendance_summary["monthly"][month_key]
+        month_cards.append(
+            f"""
+            <div class="month-card">
+              <div class="month-head">
+                <strong>{escape_html(month_key_to_label(month_key))}</strong>
+                <span>{len(lessons)} уроков</span>
+              </div>
+              <div class="month-list">
+                {''.join(f'<div class="month-row"><span>{escape_html(item["date"])}</span><small>{escape_html(item["lesson"])}</small></div>' for item in lessons[:6])}
+              </div>
+            </div>
+            """
+        )
+
+    months_html = "".join(month_cards) or '<div class="month-card empty-block">Пока нет данных по месяцам.</div>'
     hero_subject = student.subject or student.product or "Отчёт по ученику"
     hero_product = student.product or student.subject or "Академический прогресс"
+
+    translations = {
+        "ru": {
+            "eyebrow": "Индивидуальный отчёт по ученику",
+            "copy": f"{hero_subject}. Аккуратная сводка по успеваемости, выполненным заданиям и посещаемости.",
+            "open_homework": "Открыть задания",
+            "open_mock": "Открыть mock tests",
+            "open_attendance": "Открыть посещаемость",
+            "name": "ФИО",
+            "group": "Группа",
+            "product": "Продукт",
+            "status": "Статус",
+            "avg": "Средний grade",
+            "topics": "Темы",
+            "mock_count": "Mock tests",
+            "attendance": "Посещаемость",
+            "lessons": "Уроки",
+            "homework_title": "Домашние задания",
+            "homework_copy": "Результаты по homework и темам, без влияния mock tests на средний grade.",
+            "mock_title": "Mock tests",
+            "mock_copy": "Результаты пробных тестов по IELTS и NUET с отдельной логикой отображения.",
+            "attendance_title": "Посещаемость",
+            "attendance_copy": "Сводка по посещаемости, последние уроки и разбивка по месяцам.",
+            "months_title": "По месяцам",
+            "present": "Посещено",
+            "late": "Опоздал",
+            "partial": "Частично",
+            "absent": "Отсутствовал",
+            "date": "Дата",
+            "lesson": "Урок",
+            "duration": "Длительность",
+            "updated": "Обновлено",
+            "footer": "© 2026 WeGlobal • Индивидуальный отчёт ученика",
+        },
+        "en": {
+            "eyebrow": "Individual student report",
+            "copy": f"{hero_subject}. A clear summary of homework, mock tests and attendance.",
+            "open_homework": "Open homework",
+            "open_mock": "Open mock tests",
+            "open_attendance": "Open attendance",
+            "name": "Name",
+            "group": "Group",
+            "product": "Product",
+            "status": "Status",
+            "avg": "Average grade",
+            "topics": "Topics",
+            "mock_count": "Mock tests",
+            "attendance": "Attendance",
+            "lessons": "Lessons",
+            "homework_title": "Homework",
+            "homework_copy": "Results for homework and topics, excluding mock tests from the average grade.",
+            "mock_title": "Mock tests",
+            "mock_copy": "IELTS and NUET mock results with separate display logic.",
+            "attendance_title": "Attendance",
+            "attendance_copy": "Attendance summary, recent lessons and monthly breakdown.",
+            "months_title": "By month",
+            "present": "Present",
+            "late": "Late",
+            "partial": "Partial",
+            "absent": "Absent",
+            "date": "Date",
+            "lesson": "Lesson",
+            "duration": "Duration",
+            "updated": "Updated",
+            "footer": "© 2026 WeGlobal • Individual student report",
+        },
+        "kz": {
+            "eyebrow": "Оқушының жеке есебі",
+            "copy": f"{hero_subject}. Үй тапсырмасы, mock tests және қатысу бойынша жинақы есеп.",
+            "open_homework": "Тапсырмаларды ашу",
+            "open_mock": "Mock tests ашу",
+            "open_attendance": "Қатысуды ашу",
+            "name": "Аты-жөні",
+            "group": "Топ",
+            "product": "Өнім",
+            "status": "Мәртебе",
+            "avg": "Орташа grade",
+            "topics": "Тақырыптар",
+            "mock_count": "Mock tests",
+            "attendance": "Қатысу",
+            "lessons": "Сабақтар",
+            "homework_title": "Үй тапсырмасы",
+            "homework_copy": "Homework және тақырыптар нәтижесі, mock tests орташа бағалауға әсер етпейді.",
+            "mock_title": "Mock tests",
+            "mock_copy": "IELTS және NUET mock нәтижелері бөлек көрсетіледі.",
+            "attendance_title": "Қатысу",
+            "attendance_copy": "Қатысу жиынтығы, соңғы сабақтар және ай бойынша бөліну.",
+            "months_title": "Айлар бойынша",
+            "present": "Қатысты",
+            "late": "Кешікті",
+            "partial": "Ішінара",
+            "absent": "Қатыспады",
+            "date": "Күні",
+            "lesson": "Сабақ",
+            "duration": "Ұзақтығы",
+            "updated": "Жаңартылды",
+            "footer": "© 2026 WeGlobal • Оқушының жеке есебі",
+        },
+    }
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -531,8 +953,8 @@ def render_student_html(student: StudentRecord) -> str:
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 14px 0;
       gap: 16px;
+      padding: 14px 0;
     }}
     .brand {{
       font-weight: 700;
@@ -545,10 +967,29 @@ def render_student_html(student: StudentRecord) -> str:
     }}
     .top-meta {{
       display: flex;
-      gap: 20px;
       align-items: center;
+      gap: 16px;
       color: var(--muted);
       font-size: 13px;
+    }}
+    .lang-switch {{
+      display: flex;
+      gap: 6px;
+    }}
+    .lang-btn {{
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.7);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 12px;
+    }}
+    .lang-btn.active {{
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
     }}
     .hero {{
       padding: 56px 0 26px;
@@ -586,7 +1027,7 @@ def render_student_html(student: StudentRecord) -> str:
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 160px;
+      min-width: 164px;
       padding: 12px 20px;
       border-radius: 999px;
       text-decoration: none;
@@ -601,7 +1042,7 @@ def render_student_html(student: StudentRecord) -> str:
     .btn.secondary {{
       color: var(--accent);
       border: 1px solid rgba(0, 113, 227, 0.30);
-      background: rgba(255,255,255,0.80);
+      background: rgba(255,255,255,0.8);
     }}
     .btn:hover {{
       transform: translateY(-1px);
@@ -646,7 +1087,7 @@ def render_student_html(student: StudentRecord) -> str:
     }}
     .stat-strip {{
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 18px;
       margin-bottom: 18px;
     }}
@@ -734,11 +1175,11 @@ def render_student_html(student: StudentRecord) -> str:
       font-weight: 700;
       white-space: nowrap;
     }}
-    .topic-grid {{
+    .topic-grid, .mock-grid {{
       display: grid;
       gap: 10px;
     }}
-    .topic-row {{
+    .topic-row, .mock-part {{
       display: flex;
       justify-content: space-between;
       gap: 12px;
@@ -749,16 +1190,16 @@ def render_student_html(student: StudentRecord) -> str:
       padding: 14px 16px;
       font-size: 15px;
     }}
-    .topic-row span {{
-      max-width: 82%;
+    .mock-part.total {{
+      background: #f0f6ff;
     }}
-    .metric-list {{
+    .metrics-grid {{
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
       margin-bottom: 18px;
     }}
-    .metric-box {{
+    .metric-box, .month-card {{
       padding: 18px;
       border-radius: 22px;
       background: var(--panel-strong);
@@ -767,6 +1208,39 @@ def render_student_html(student: StudentRecord) -> str:
     .metric-box .value {{
       font-size: 36px;
       margin-top: 6px;
+    }}
+    .months-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .month-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }}
+    .month-list {{
+      display: grid;
+      gap: 8px;
+    }}
+    .month-row {{
+      display: grid;
+      gap: 2px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: #fafafc;
+      border: 1px solid var(--line);
+    }}
+    .month-row span {{
+      font-weight: 600;
+      font-size: 13px;
+    }}
+    .month-row small {{
+      color: var(--muted);
+      font-size: 12px;
     }}
     .table-wrap {{
       overflow: auto;
@@ -804,7 +1278,7 @@ def render_student_html(student: StudentRecord) -> str:
       font-size: 13px;
     }}
     @media (max-width: 980px) {{
-      .identity-grid, .stat-strip, .metric-list {{
+      .identity-grid, .stat-strip, .metrics-grid {{
         grid-template-columns: 1fr;
       }}
       .course-meta, .panel-head, .topbar-inner {{
@@ -825,73 +1299,98 @@ def render_student_html(student: StudentRecord) -> str:
       <div class="brand">WeGlobal <span>Reports</span></div>
       <div class="top-meta">
         <span>{escape_html(hero_product)}</span>
-        <span>Обновлено: {escape_html(student.updated_at)}</span>
+        <span><span data-i18n="updated">{escape_html(translations["ru"]["updated"])}</span>: {escape_html(student.updated_at)}</span>
+        <div class="lang-switch">
+          <button class="lang-btn active" data-lang="ru">RU</button>
+          <button class="lang-btn" data-lang="kz">KZ</button>
+          <button class="lang-btn" data-lang="en">EN</button>
+        </div>
       </div>
     </div>
   </div>
 
   <section class="hero">
-    <div class="eyebrow">Индивидуальный отчёт по ученику</div>
+    <div class="eyebrow" data-i18n="eyebrow">{escape_html(translations["ru"]["eyebrow"])}</div>
     <h1>{escape_html(student.name)}</h1>
-    <div class="hero-copy">{escape_html(hero_subject)}. Аккуратная сводка по успеваемости, выполненным заданиям и посещаемости.</div>
+    <div class="hero-copy" data-i18n="copy">{escape_html(translations["ru"]["copy"])}</div>
     <div class="hero-actions">
-      <a class="btn primary" href="#ocenki">Открыть оценки</a>
-      <a class="btn secondary" href="#poseshchaemost">Открыть посещаемость</a>
+      <a class="btn primary" href="#homework" data-i18n="open_homework">{escape_html(translations["ru"]["open_homework"])}</a>
+      <a class="btn secondary" href="#mock-tests" data-i18n="open_mock">{escape_html(translations["ru"]["open_mock"])}</a>
+      <a class="btn secondary" href="#attendance" data-i18n="open_attendance">{escape_html(translations["ru"]["open_attendance"])}</a>
     </div>
     <div class="hero-panel">
       <div class="identity-grid">
-        <div class="identity-card"><span class="label">ФИО</span><div class="value">{escape_html(student.name)}</div></div>
-        <div class="identity-card"><span class="label">Группа</span><div class="value">{escape_html(student.group or '—')}</div></div>
-        <div class="identity-card"><span class="label">Продукт</span><div class="value">{escape_html(student.product or '—')}</div></div>
-        <div class="identity-card"><span class="label">Статус</span><div class="value">{escape_html(student.status or '—')}</div></div>
+        <div class="identity-card"><span class="label" data-i18n="name">{escape_html(translations["ru"]["name"])}</span><div class="value">{escape_html(student.name)}</div></div>
+        <div class="identity-card"><span class="label" data-i18n="group">{escape_html(translations["ru"]["group"])}</span><div class="value">{escape_html(student.group or '—')}</div></div>
+        <div class="identity-card"><span class="label" data-i18n="product">{escape_html(translations["ru"]["product"])}</span><div class="value">{escape_html(student.product or '—')}</div></div>
+        <div class="identity-card"><span class="label" data-i18n="status">{escape_html(translations["ru"]["status"])}</span><div class="value">{escape_html(student.status or '—')}</div></div>
       </div>
     </div>
   </section>
 
   <section class="section">
     <div class="stat-strip">
-      <div class="stat-card"><span class="label">Средний grade</span><div class="value">{summary.get('overall_average') if summary.get('overall_average') is not None else '—'}</div></div>
-      <div class="stat-card"><span class="label">Темы</span><div class="value">{summary.get('topic_count', 0)}</div></div>
-      <div class="stat-card"><span class="label">Посещаемость</span><div class="value">{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</div></div>
-      <div class="stat-card"><span class="label">Уроки</span><div class="value">{summary.get('lessons_tracked', 0)}</div></div>
+      <div class="stat-card"><span class="label" data-i18n="avg">{escape_html(translations["ru"]["avg"])}</span><div class="value">{format_number(summary.get('overall_average'))}</div></div>
+      <div class="stat-card"><span class="label" data-i18n="topics">{escape_html(translations["ru"]["topics"])}</span><div class="value">{summary.get('topic_count', 0)}</div></div>
+      <div class="stat-card"><span class="label" data-i18n="mock_count">{escape_html(translations["ru"]["mock_count"])}</span><div class="value">{summary.get('mock_count', 0)}</div></div>
+      <div class="stat-card"><span class="label" data-i18n="attendance">{escape_html(translations["ru"]["attendance"])}</span><div class="value">{str(summary.get('attendance_rate')) + '%' if summary.get('attendance_rate') is not None else '—'}</div></div>
+      <div class="stat-card"><span class="label" data-i18n="lessons">{escape_html(translations["ru"]["lessons"])}</span><div class="value">{summary.get('lessons_tracked', 0)}</div></div>
     </div>
 
     <div class="stack">
-      <div class="panel" id="ocenki">
+      <div class="panel" id="homework">
         <div class="panel-head">
           <div>
-            <h2>Курсы и оценки</h2>
-            <div class="panel-subtle">Индивидуальные результаты по всем найденным курсам ученика.</div>
+            <h2 data-i18n="homework_title">{escape_html(translations["ru"]["homework_title"])}</h2>
+            <div class="panel-subtle" data-i18n="homework_copy">{escape_html(translations["ru"]["homework_copy"])}</div>
           </div>
-          <div class="pill">{summary.get('course_count', 0)} курс(ов)</div>
+          <div class="pill">{summary.get('topic_count', 0)} HW</div>
         </div>
-        {course_sections}
+        {homework_html}
       </div>
 
-      <div class="panel" id="poseshchaemost">
+      <div class="panel" id="mock-tests">
         <div class="panel-head">
           <div>
-            <h2>Посещаемость</h2>
-            <div class="panel-subtle">Сводка по посещаемости и последние найденные уроки.</div>
+            <h2 data-i18n="mock_title">{escape_html(translations["ru"]["mock_title"])}</h2>
+            <div class="panel-subtle" data-i18n="mock_copy">{escape_html(translations["ru"]["mock_copy"])}</div>
+          </div>
+          <div class="pill">{summary.get('mock_count', 0)} mock</div>
+        </div>
+        {mock_html}
+      </div>
+
+      <div class="panel" id="attendance">
+        <div class="panel-head">
+          <div>
+            <h2 data-i18n="attendance_title">{escape_html(translations["ru"]["attendance_title"])}</h2>
+            <div class="panel-subtle" data-i18n="attendance_copy">{escape_html(translations["ru"]["attendance_copy"])}</div>
           </div>
           <div class="pill">{student.attendance_summary.get('total_lessons', 0)} уроков</div>
         </div>
 
-        <div class="metric-list">
-          <div class="metric-box"><span class="label">Посещено</span><div class="value">{student.attendance_summary.get('present', 0)}</div></div>
-          <div class="metric-box"><span class="label">Опоздал</span><div class="value">{student.attendance_summary.get('late', 0)}</div></div>
-          <div class="metric-box"><span class="label">Частично</span><div class="value">{student.attendance_summary.get('partial', 0)}</div></div>
-          <div class="metric-box"><span class="label">Отсутствовал</span><div class="value">{student.attendance_summary.get('absent', 0)}</div></div>
+        <div class="metrics-grid">
+          <div class="metric-box"><span class="label" data-i18n="present">{escape_html(translations["ru"]["present"])}</span><div class="value">{student.attendance_summary.get('present', 0)}</div></div>
+          <div class="metric-box"><span class="label" data-i18n="late">{escape_html(translations["ru"]["late"])}</span><div class="value">{student.attendance_summary.get('late', 0)}</div></div>
+          <div class="metric-box"><span class="label" data-i18n="partial">{escape_html(translations["ru"]["partial"])}</span><div class="value">{student.attendance_summary.get('partial', 0)}</div></div>
+          <div class="metric-box"><span class="label" data-i18n="absent">{escape_html(translations["ru"]["absent"])}</span><div class="value">{student.attendance_summary.get('absent', 0)}</div></div>
         </div>
+
+        <div class="panel-head">
+          <div>
+            <h2 data-i18n="months_title">{escape_html(translations["ru"]["months_title"])}</h2>
+          </div>
+        </div>
+        <div class="months-grid">{months_html}</div>
 
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Дата</th>
-                <th>Урок</th>
-                <th>Статус</th>
-                <th>Duration</th>
+                <th data-i18n="date">{escape_html(translations["ru"]["date"])}</th>
+                <th data-i18n="lesson">{escape_html(translations["ru"]["lesson"])}</th>
+                <th data-i18n="status">{escape_html(translations["ru"]["status"])}</th>
+                <th data-i18n="duration">{escape_html(translations["ru"]["duration"])}</th>
               </tr>
             </thead>
             <tbody>{lesson_rows}</tbody>
@@ -901,7 +1400,23 @@ def render_student_html(student: StudentRecord) -> str:
     </div>
   </section>
 
-  <div class="footer">© 2026 WeGlobal • Индивидуальный отчёт ученика</div>
+  <div class="footer" data-i18n="footer">{escape_html(translations["ru"]["footer"])}</div>
+
+  <script>
+    const translations = {json.dumps(translations, ensure_ascii=False)};
+    const buttons = document.querySelectorAll('.lang-btn');
+    function applyLanguage(lang) {{
+      document.documentElement.lang = lang;
+      document.querySelectorAll('[data-i18n]').forEach(node => {{
+        const key = node.getAttribute('data-i18n');
+        if (translations[lang] && translations[lang][key]) {{
+          node.textContent = translations[lang][key];
+        }}
+      }});
+      buttons.forEach(btn => btn.classList.toggle('active', btn.dataset.lang === lang));
+    }}
+    buttons.forEach(btn => btn.addEventListener('click', () => applyLanguage(btn.dataset.lang)));
+  </script>
 </body>
 </html>
 """
@@ -916,7 +1431,7 @@ def render_index_html(students: list[StudentRecord]) -> str:
             <span>{escape_html(student.group or 'Без группы')}</span>
           </div>
           <div class="card-meta">
-            <b>{student.attendance_summary.get('summary', {}).get('overall_average', '—')}</b>
+            <b>{format_number(student.attendance_summary.get('summary', {}).get('overall_average'))}</b>
             <small>grade</small>
           </div>
         </a>
@@ -1037,7 +1552,7 @@ def render_index_html(students: list[StudentRecord]) -> str:
   <section class="hero">
     <div class="eyebrow">Индивидуальные отчёты учеников</div>
     <h1>WeGlobal Reports</h1>
-    <p>Аккуратные персональные страницы по каждому ученику с отдельной ссылкой, оценками и посещаемостью.</p>
+    <p>Аккуратные персональные страницы по каждому ученику с отдельной ссылкой, homework, mock tests и посещаемостью.</p>
   </section>
   <div class="grid-wrap">
     <div class="grid">{cards}</div>
